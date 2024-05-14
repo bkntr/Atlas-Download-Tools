@@ -22,6 +22,8 @@ See the module `atldld.utils.py` for lower level
 functions that are called within this module.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, Generator, Optional, Tuple
 
 import numpy as np
@@ -243,6 +245,7 @@ class DatasetDownloader:
     def __init__(
         self,
         dataset_id: int,
+        download_dir: Path,
         downsample_ref: int = 25,
         detection_xy: Tuple[float, float] = (0, 0),
         include_expression: bool = False,
@@ -253,6 +256,7 @@ class DatasetDownloader:
         self.detection_xy = detection_xy
         self.include_expression = include_expression
         self.downsample_img = downsample_img
+        self.download_dir = download_dir
 
         self.metadata: Dict[str, Any] = {}
         # populated by calling `fetch_metadata`
@@ -339,10 +343,70 @@ class DatasetDownloader:
         }
         self.metadata = metadata
 
+    def process_image(
+        self, metadata_image, metadata_dataset, slice_coordinate_ix, axis
+    ):
+        z = metadata_dataset["section_thickness"] * metadata_image["section_number"]
+        detection_xy = np.array(
+            [
+                [self.detection_xy[0]],
+                [self.detection_xy[1]],
+                [z],
+            ],
+            dtype=np.float32,
+        )
+        detection_pir = xy_to_pir(
+            detection_xy,
+            affine_2d=metadata_image["affine_tsv"],
+            affine_3d=metadata_dataset["affine_tvr"],
+        )
+        slice_coordinate = detection_pir[slice_coordinate_ix, 0].item()
+
+        df = get_parallel_transform(
+            slice_coordinate,
+            affine_2d=metadata_image["affine_tvs"],
+            affine_3d=metadata_dataset["affine_trv"],
+            downsample_ref=self.downsample_ref,
+            axis=axis,
+            downsample_img=self.downsample_img,
+        )
+
+        image_id = metadata_image["id"]
+        img, img_path = get_image(
+            image_id,
+            downsample=self.downsample_img,
+            folder=self.download_dir,
+        )
+        if img is None:
+            return None
+
+        if self.include_expression:
+            img_expression, img_expression_path = get_image(
+                image_id,
+                expression=True,
+                downsample=self.downsample_img,
+                folder=self.download_dir,
+            )
+        else:
+            img_expression = None
+            img_expression_path = None
+
+        return (
+            image_id,
+            slice_coordinate,
+            img,
+            img_path,
+            img_expression,
+            img_expression_path,
+            df,
+        )
+
     def run(
         self,
     ) -> Generator[
-        Tuple[int, float, np.ndarray, Optional[np.ndarray], DisplacementField],
+        Tuple[
+            int, float, np.ndarray, Path, Optional[np.ndarray], Path, DisplacementField
+        ],
         None,
         None,
     ]:
@@ -389,46 +453,45 @@ class DatasetDownloader:
             raise ValueError(f"Unrecognized plane of section {plane_of_section}")
 
         for metadata_image in metadata_images:
-            z = metadata_dataset["section_thickness"] * metadata_image["section_number"]
-            detection_xy = np.array(
-                [
-                    [self.detection_xy[0]],
-                    [self.detection_xy[1]],
-                    [z],
-                ],
-                dtype=np.float32,
-            )
-            detection_pir = xy_to_pir(
-                detection_xy,
-                affine_2d=metadata_image["affine_tsv"],
-                affine_3d=metadata_dataset["affine_tvr"],
-            )
-            slice_coordinate = detection_pir[slice_coordinate_ix, 0].item()
-
-            df = get_parallel_transform(
-                slice_coordinate,
-                affine_2d=metadata_image["affine_tvs"],
-                affine_3d=metadata_dataset["affine_trv"],
-                downsample_ref=self.downsample_ref,
-                axis=axis,
-                downsample_img=self.downsample_img,
+            yield self.process_image(
+                metadata_image, metadata_dataset, slice_coordinate_ix, axis
             )
 
-            image_id = metadata_image["id"]
-            img = get_image(
-                image_id,
-                downsample=self.downsample_img,
-            )
-            if img is None:
-                continue
+    def run_parallel(self, max_workers: int = 5) -> Generator[
+        Tuple[
+            int, float, np.ndarray, Path, Optional[np.ndarray], Path, DisplacementField
+        ],
+        None,
+        None,
+    ]:
+        if not self.metadata:
+            raise RuntimeError("The metadata is empty. Please run `fetch_metadata`")
 
-            if self.include_expression:
-                img_expression = get_image(
-                    image_id,
-                    expression=True,
-                    downsample=self.downsample_img,
-                )
-            else:
-                img_expression = None
+        metadata_images = self.metadata["images"]
+        metadata_dataset = self.metadata["dataset"]
 
-            yield image_id, slice_coordinate, img, img_expression, df
+        plane_of_section = metadata_dataset["plane_of_section_id"]
+        if plane_of_section == 1:
+            slice_coordinate_ix = 0
+            axis = "coronal"
+        elif plane_of_section == 2:
+            slice_coordinate_ix = 2
+            axis = "sagittal"
+        else:
+            raise ValueError(f"Unrecognized plane of section {plane_of_section}")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self.process_image,
+                    metadata_image,
+                    metadata_dataset,
+                    slice_coordinate_ix,
+                    axis,
+                ): metadata_image
+                for metadata_image in metadata_images
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    yield result

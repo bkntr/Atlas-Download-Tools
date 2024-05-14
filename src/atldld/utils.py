@@ -71,7 +71,7 @@ def get_image(
     folder: Optional[Union[str, pathlib.Path]] = None,
     expression: bool = False,
     downsample: int = 0,
-) -> np.ndarray | None:
+) -> tuple[np.ndarray | None, pathlib.Path]:
     """Download an image from AIBS' servers given an image ID.
 
     All requested images are stored in the `folder` and then read.
@@ -145,7 +145,7 @@ def get_image(
             img = None
             print(f"For info, {image_id} is corrupted.")
 
-    return img
+    return img, image_path
 
 
 def get_corners_in_ref_space(
